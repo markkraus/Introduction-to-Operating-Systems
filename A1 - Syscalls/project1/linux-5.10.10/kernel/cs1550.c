@@ -10,6 +10,7 @@
 static DEFINE_RWLOCK(sem_rwlock); // Enforces one process at a time to read/write
 static LIST_HEAD(sem_list); // Global static list of semaphores
 static long sem_id_count = 0; // Unique semaphore ID given at the creation of a new semaphore
+static spinlock_t sem_id_lock; // Spinlock to protect sem_id_count
 
 /**
  * Finds the semaphore within the system-wide list of semaphores.
@@ -55,6 +56,8 @@ static struct cs1550_sem *get_sem_id (long sem_id)
  */
 SYSCALL_DEFINE1(cs1550_create, long, value)
 {
+  spin_lock_init(&sem_id_lock);
+
   if (value < 0) {
     // Unacceptable initial value
     return -EINVAL;
@@ -69,7 +72,11 @@ SYSCALL_DEFINE1(cs1550_create, long, value)
 
   // Initialize semaphore struct members
   sem->value = value;
+
+  spin_lock(&sem_id_lock);
   sem->sem_id = sem_id_count++;
+  spin_unlock(&sem_id_lock);
+
   spin_lock_init(&sem->lock);
   INIT_LIST_HEAD(&sem->list);
   INIT_LIST_HEAD(&sem->waiting_tasks);
@@ -79,8 +86,9 @@ SYSCALL_DEFINE1(cs1550_create, long, value)
   list_add(&sem->list, &sem_list);
   write_unlock(&sem_rwlock);
 
-	return sem->sem_id;
+  return sem->sem_id;
 }
+
 
 /**
  * Performs the down() operation on an existing semaphore
@@ -97,45 +105,42 @@ SYSCALL_DEFINE1(cs1550_create, long, value)
 SYSCALL_DEFINE1(cs1550_down, long, sem_id)
 {
   // Get the semaphore corresponding to the ID argument
-  read_lock(&sem_rwlock);
   struct cs1550_sem *sem = get_sem_id(sem_id);
   if (sem == NULL) {
     // Invalid semaphore ID
-    read_unlock(&sem_rwlock);
     return -EINVAL;
   }
-  read_unlock(&sem_rwlock);
+
+  // Acquire spinlock to modify the semaphore value
+  spin_lock(&sem->lock);
 
   // Update the semaphore value
-  write_lock(&sem_rwlock);
-  spin_lock(&sem->lock);
   sem->value--;
-  spin_unlock(&sem->lock);
 
   if (sem->value < 0) {
     // No more available resources - suspend current process
 
     // Allocate memory for the process
-    struct cs1550_task *task = kmalloc(sizeof(struct cs1550_task), GFP_KERNEL);
+    struct cs1550_task *task = kmalloc(sizeof(struct cs1550_task), GFP_ATOMIC);
     if (!task) {
       // Memory allocation failed
-      write_unlock(&sem_rwlock);
+      spin_unlock(&sem->lock);
       return -ENOMEM;
     }
     
     // Initialize, link, and add task to waiting list
     INIT_LIST_HEAD(&task->list);
-    task->task = current; // Assign the task control block to the current executing task
-    list_add_tail(&task->list, &sem->waiting_tasks); // Add the task to the semaphore's waiting tasks list
+    task->task = current;
+    list_add_tail(&task->list, &sem->waiting_tasks);
 
-    write_unlock(&sem_rwlock);
+    spin_unlock(&sem->lock);
 
     // Set the process to sleep
     set_current_state(TASK_INTERRUPTIBLE);
     schedule();
   } else {
-    // No need to sleep process, but unlock the RWLock
-    write_unlock(&sem_rwlock);
+    // No need to sleep process, but unlock the spinlock
+    spin_unlock(&sem->lock);
   }
 
 	return 0;
@@ -155,20 +160,17 @@ SYSCALL_DEFINE1(cs1550_down, long, sem_id)
 SYSCALL_DEFINE1(cs1550_up, long, sem_id)
 {
   // Find the semaphore from the system-wide semaphore list
-  read_lock(&sem_rwlock);
   struct cs1550_sem *sem = get_sem_id(sem_id);
   if (sem == NULL) {
     // Invalid semaphore ID
-    read_unlock(&sem_rwlock);
     return -EINVAL;
   }
-  read_unlock(&sem_rwlock);
+
+  // Acquire spinlock to modify the semaphore value
+  spin_lock(&sem->lock);
 
   // Update the semaphore value
-  write_lock(&sem_rwlock);
-  spin_lock(&sem->lock);
   sem->value++;
-  spin_unlock(&sem->lock);
 
   // Wake up a process waiting on the semaphore
   if (sem->value <= 0) {
@@ -177,7 +179,8 @@ SYSCALL_DEFINE1(cs1550_up, long, sem_id)
     list_del(&task->list);
     wake_up_process(task->task);
   }
-  write_unlock(&sem_rwlock);
+
+  spin_unlock(&sem->lock);
 
 	return 0;
 }
@@ -193,26 +196,29 @@ SYSCALL_DEFINE1(cs1550_up, long, sem_id)
 SYSCALL_DEFINE1(cs1550_close, long, sem_id)
 {
   // Find the semaphore from the system-wide semaphore list
-  read_lock(&sem_rwlock);
   struct cs1550_sem *sem = get_sem_id(sem_id);
   if (sem == NULL) {
     // Invalid semaphore ID
-    read_unlock(&sem_rwlock);
     return -EINVAL;
   }
-  read_unlock(&sem_rwlock);
+
+  // Acquire spinlock to protect the semaphore resources
+  spin_lock(&sem->lock);
 
   // Free each task waiting on the semaphore
-  write_lock(&sem_rwlock);
-  struct cs1550_sem *task, *temp_task;
+  struct cs1550_task *task, *temp_task;
   list_for_each_entry_safe(task, temp_task, &sem->waiting_tasks, list) {
     kfree(task);
   }
 
   // Remove the semaphore from the system-wide list and free its allocated memory
+  write_lock(&sem_rwlock);
   list_del(&sem->list);
-  kfree(sem);
   write_unlock(&sem_rwlock);
+
+  spin_unlock(&sem->lock);
+
+  kfree(sem);
 
 	return 0;
 }
